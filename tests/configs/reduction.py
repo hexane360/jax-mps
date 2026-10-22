@@ -372,3 +372,80 @@ def make_reduction_op_configs():
             lambda key: random.normal(key, (2, 4, 4, 4, 3)),
             name="maxpool3d-valid",
         )
+
+    # Bitwise reductions (stablehlo.reduce with and/or/xor bodies). MLX has no
+    # native bitwise reduce for integers, so these exercise the fold fallback;
+    # bool inputs exercise the all/any/parity fast paths. Non-identity
+    # initializers and empty reduced dimensions must honor the init value.
+    #
+    # Inputs are biased so the fold over the input does not saturate (AND
+    # towards all-zero, OR towards all-one); otherwise a dropped initializer
+    # would go unnoticed. Integer inputs keep bits 20-30 fixed (set for AND,
+    # clear for OR/XOR) so the initializer's high bits always show up.
+    def _bool_input(shape, p):
+        return lambda key: random.bernoulli(key, p, shape)
+
+    def _int_input(shape, high_bits=0):
+        return lambda key: (
+            random.randint(key, shape, 0, 1 << 20, dtype=jnp.int32) | high_bits
+        )
+
+    bitwise_init = 0x0A5A5A5A
+
+    with OperationTestConfig.module_name("reduction-bitwise"):
+        for name, op in [
+            ("and", lax.bitwise_and),
+            ("or", lax.bitwise_or),
+            ("xor", lax.bitwise_xor),
+        ]:
+            identity_int = -1 if name == "and" else 0
+            identity_bool = name == "and"
+            high_bits = 0x7FF00000 if name == "and" else 0
+            p = {"and": 0.9, "or": 0.1, "xor": 0.5}[name]
+            for shape, axes, suffix in [
+                ((4, 7), (1,), "axis1"),
+                ((3, 5, 6), (0, 2), "axes02"),
+                ((3, 0), (1,), "empty"),
+                ((1,), (0,), "size1"),
+            ]:
+                yield OperationTestConfig(
+                    lambda x, op=op, axes=axes, init=identity_int: lax.reduce(
+                        x, jnp.int32(init), op, axes
+                    ),
+                    _int_input(shape, high_bits),
+                    name=f"reduce_{name}-int-{suffix}",
+                )
+                yield OperationTestConfig(
+                    lambda x, op=op, axes=axes, init=identity_bool: lax.reduce(
+                        x, jnp.bool_(init), op, axes
+                    ),
+                    _bool_input(shape, p),
+                    name=f"reduce_{name}-bool-{suffix}",
+                )
+                # Non-identity initializer: must be folded in exactly once.
+                # StableHLO leaves non-identity inits implementation-defined,
+                # and XLA CPU (the reference) drops the init when the reduced
+                # size is 1 (it rewrites the reduce to a reshape), so there is
+                # no stable reference for that case.
+                if suffix == "size1":
+                    continue
+                yield OperationTestConfig(
+                    lambda x, op=op, axes=axes: lax.reduce(
+                        x, jnp.int32(bitwise_init), op, axes
+                    ),
+                    _int_input(shape, high_bits),
+                    name=f"reduce_{name}-int-init-{suffix}",
+                )
+                yield OperationTestConfig(
+                    lambda x, op=op, axes=axes, init=not identity_bool: lax.reduce(
+                        x, jnp.bool_(init), op, axes
+                    ),
+                    _bool_input(shape, p),
+                    name=f"reduce_{name}-bool-init-{suffix}",
+                )
+        # Long axis: exercises the logarithmic tree fold with odd tails.
+        yield OperationTestConfig(
+            lambda x: lax.reduce(x, jnp.int32(0), lax.bitwise_xor, (0,)),
+            _int_input((1023, 3)),
+            name="reduce_xor-int-long",
+        )

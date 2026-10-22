@@ -1,6 +1,7 @@
 // Reduction op handlers (reduce, reduce_window, select_and_scatter).
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <tuple>
 
@@ -12,7 +13,71 @@ namespace jax_mps {
 namespace {
 
 // Helper to detect reduction type by analyzing the body region
-enum class ReduceType { Sum, Max, Min, Prod, And, Or, Unknown };
+enum class ReduceType { Sum, Max, Min, Prod, And, Or, Xor, Unknown };
+
+using BinaryOp = std::function<mlx::core::array(const mlx::core::array&, const mlx::core::array&)>;
+
+// Folds an associative, commutative elementwise binary op (e.g. bitwise_xor)
+// across `axes`, then combines the result with the StableHLO initializer
+// exactly once. MLX has no native reduce kernel for bitwise ops (only
+// sum/max/min/prod), so this is the fallback for reductions whose body is
+// stablehlo.and/or/xor on non-bool dtypes.
+//
+// The reduced axes are moved to the back and flattened into one axis, which
+// is then folded pairwise (halving each stage), so graph size and depth are
+// O(log N) in the number of reduced elements. An empty reduced domain yields
+// the initializer broadcast to the result shape.
+mlx::core::array FoldReduce(const mlx::core::array& input, const std::vector<int>& axes,
+                            const mlx::core::array& init, const BinaryOp& op) {
+    int rank = static_cast<int>(input.ndim());
+    std::vector<bool> reduced(rank, false);
+    for (int axis : axes)
+        reduced[axis < 0 ? axis + rank : axis] = true;
+
+    std::vector<int> perm;
+    mlx::core::Shape keptShape;
+    int n = 1;
+    for (int d = 0; d < rank; ++d) {
+        if (!reduced[d]) {
+            perm.push_back(d);
+            keptShape.push_back(input.shape(d));
+        }
+    }
+    for (int d = 0; d < rank; ++d) {
+        if (reduced[d]) {
+            perm.push_back(d);
+            n *= input.shape(d);
+        }
+    }
+
+    auto typedInit = mlx::core::astype(init, input.dtype());
+    if (n == 0)
+        return mlx::core::broadcast_to(typedInit, keptShape);
+
+    int foldAxis = static_cast<int>(keptShape.size());
+    mlx::core::Shape flatShape = keptShape;
+    flatShape.push_back(n);
+    auto acc = mlx::core::reshape(mlx::core::transpose(input, perm), flatShape);
+
+    // Slices [lo, hi) along the fold axis, keeping all leading axes whole.
+    auto sliceFold = [&](const mlx::core::array& a, int lo, int hi) {
+        mlx::core::Shape starts(foldAxis + 1, 0);
+        mlx::core::Shape stops = a.shape();
+        starts[foldAxis] = lo;
+        stops[foldAxis] = hi;
+        return mlx::core::slice(a, starts, stops);
+    };
+
+    while (n > 1) {
+        int half = n / 2;
+        auto folded = op(sliceFold(acc, 0, half), sliceFold(acc, half, 2 * half));
+        if (n % 2 != 0)
+            folded = mlx::core::concatenate({folded, sliceFold(acc, 2 * half, n)}, foldAxis);
+        acc = folded;
+        n = half + (n % 2);
+    }
+    return op(mlx::core::squeeze(acc, foldAxis), typedInit);
+}
 
 ReduceType DetectReduceType(mlir::Region& body) {
     if (body.empty())
@@ -43,6 +108,8 @@ ReduceType DetectReduceType(mlir::Region& body) {
             detected = ReduceType::And;
         else if (opName == "stablehlo.or")
             detected = ReduceType::Or;
+        else if (opName == "stablehlo.xor")
+            detected = ReduceType::Xor;
     }
     return detected;
 }
@@ -115,7 +182,8 @@ bool HandleReduce(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
 
     for (size_t i = 0; i < numInputs; ++i) {
         auto* input = RequireValue(values, reduceOp.getInputs()[i], "stablehlo.reduce");
-        if (!input)
+        auto* init = RequireValue(values, reduceOp.getInitValues()[i], "stablehlo.reduce");
+        if (!input || !init)
             return false;
 
         std::optional<mlx::core::array> result;
@@ -133,22 +201,43 @@ bool HandleReduce(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
                 result = mlx::core::prod(*input, axes);
                 break;
             case ReduceType::And:
-                if (input->dtype() != mlx::core::bool_) {
-                    MPS_LOG_ERROR(
-                        "stablehlo.reduce: bitwise And reduction not supported for non-bool "
-                        "types\n");
-                    return false;
+                if (input->dtype() == mlx::core::bool_) {
+                    result = mlx::core::logical_and(mlx::core::all(*input, axes),
+                                                    mlx::core::astype(*init, mlx::core::bool_));
+                } else {
+                    result = FoldReduce(*input, axes, *init,
+                                        [](const mlx::core::array& a, const mlx::core::array& b) {
+                                            return mlx::core::bitwise_and(a, b);
+                                        });
                 }
-                result = mlx::core::all(*input, axes);
                 break;
             case ReduceType::Or:
-                if (input->dtype() != mlx::core::bool_) {
-                    MPS_LOG_ERROR(
-                        "stablehlo.reduce: bitwise Or reduction not supported for non-bool "
-                        "types\n");
-                    return false;
+                if (input->dtype() == mlx::core::bool_) {
+                    result = mlx::core::logical_or(mlx::core::any(*input, axes),
+                                                   mlx::core::astype(*init, mlx::core::bool_));
+                } else {
+                    result = FoldReduce(*input, axes, *init,
+                                        [](const mlx::core::array& a, const mlx::core::array& b) {
+                                            return mlx::core::bitwise_or(a, b);
+                                        });
                 }
-                result = mlx::core::any(*input, axes);
+                break;
+            case ReduceType::Xor:
+                if (input->dtype() == mlx::core::bool_) {
+                    // XOR-reduce over bools is parity: odd number of trues, then
+                    // xor'd (not_equal on bools) with the initializer.
+                    auto counts = mlx::core::sum(mlx::core::astype(*input, mlx::core::int32), axes);
+                    auto parity = mlx::core::not_equal(
+                        mlx::core::bitwise_and(counts, mlx::core::array(1, mlx::core::int32)),
+                        mlx::core::array(0, mlx::core::int32));
+                    result =
+                        mlx::core::not_equal(parity, mlx::core::astype(*init, mlx::core::bool_));
+                } else {
+                    result = FoldReduce(*input, axes, *init,
+                                        [](const mlx::core::array& a, const mlx::core::array& b) {
+                                            return mlx::core::bitwise_xor(a, b);
+                                        });
+                }
                 break;
             default:
                 MPS_LOG_ERROR("stablehlo.reduce: unsupported reduction type\n");
