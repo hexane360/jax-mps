@@ -84,9 +84,11 @@ private:
     // fill donated_inputs_/input_output_aliases_ from argument attributes
     void ParseDonationAttributes();
 
-    // resolve donations using buffer values & non_donatable
-    std::vector<bool> ResolveDonations(const std::vector<MlxBuffer*>& inputs,
-                                       const std::vector<int64_t>& non_donatable) const;
+    // resolve donations using buffer values & non_donatable; returns false (and
+    // sets error) if a donated buffer is also passed at another argument position
+    bool ResolveDonations(const std::vector<MlxBuffer*>& inputs,
+                          const std::vector<int64_t>& non_donatable, std::vector<bool>& donate,
+                          std::string& error) const;
 
     mps::ParsedModule parsed_module_;
     std::string error_;

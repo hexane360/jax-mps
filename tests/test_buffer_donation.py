@@ -85,20 +85,21 @@ def test_donation_multiple_consumers(mps_device):
     assert p.is_deleted(), "donated argument should be invalidated"
 
 
-def test_non_donatable_input_indices(mps_device):
-    """Passing one array to both a donated and a non-donated parameter.
+@pytest.mark.parametrize("donate_argnums", [0, (0, 1)])
+def test_non_donatable_input_indices(mps_device, donate_argnums):
+    """Passing one array to a donated parameter and to another parameter.
 
-    The buffer is still owned through the non-donated position,
-    so reclaiming it would be a use-after-delete.
+    Like XLA's other backends, this is rejected rather than silently skipping
+    the donation; the buffer must stay usable afterwards.
     """
-    fn = jax.jit(lambda u, v: u + v, donate_argnums=0)
+    fn = jax.jit(lambda u, v: u + v, donate_argnums=donate_argnums)
 
     s = _on_device(np.arange(4, dtype=np.float32), mps_device)
 
-    out = fn(s, s)
+    with pytest.raises(jax.errors.JaxRuntimeError, match="previously donated"):
+        fn(s, s)
 
-    np.testing.assert_allclose(np.asarray(out), np.arange(4) * 2)
-    assert not s.is_deleted(), "buffer used at a non-donated position must survive"
+    assert not s.is_deleted(), "rejected call must not consume the buffer"
     np.testing.assert_allclose(np.asarray(s), np.arange(4))
 
 

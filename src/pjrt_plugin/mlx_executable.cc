@@ -16,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -923,13 +924,15 @@ std::string MlxExecutable::OptimizedModuleText() const {
     return text;
 }
 
-std::vector<bool> MlxExecutable::ResolveDonations(const std::vector<MlxBuffer*>& inputs,
-                                                  const std::vector<int64_t>& non_donatable) const {
+bool MlxExecutable::ResolveDonations(const std::vector<MlxBuffer*>& inputs,
+                                     const std::vector<int64_t>& non_donatable,
+                                     std::vector<bool>& donate, std::string& error) const {
+    donate.clear();
     if (!has_donations_ || inputs.size() != donated_inputs_.size()) {
-        return {};
+        return true;
     }
 
-    std::vector<bool> donate = donated_inputs_;
+    donate = donated_inputs_;
 
     for (int64_t index : non_donatable) {
         if (index >= 0 && static_cast<size_t>(index) < donate.size()) {
@@ -937,20 +940,27 @@ std::vector<bool> MlxExecutable::ResolveDonations(const std::vector<MlxBuffer*>&
         }
     }
 
-    // manually check for aliased inputs
-    // we don't donate any arrays which are aliased
+    // A donated buffer must not appear at any other argument position: its
+    // storage would be reclaimed while still in use. Reject this like XLA's
+    // PJRT clients do, before anything has been invalidated.
+    std::unordered_map<const MlxBuffer*, size_t> first_use;
+    first_use.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-        if (donate[i]) {
+        auto [it, inserted] = first_use.emplace(inputs[i], i);
+        if (inserted) {
             continue;
         }
-        for (size_t j = 0; j < inputs.size(); ++j) {
-            if (j != i && inputs[j] == inputs[i]) {
-                donate[j] = false;
-            }
+        size_t first = it->second;
+        if (donate[first] || donate[i]) {
+            error =
+                "Attempt to use a buffer that was previously donated in the same call to "
+                "Execute() (flattened argument " +
+                std::to_string(i) + ", first use: " + std::to_string(first) + ")";
+            return false;
         }
     }
 
-    return donate;
+    return true;
 }
 
 MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
@@ -998,7 +1008,11 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
         inputArrays.push_back(inputs[i]->array());
     }
 
-    const std::vector<bool> donations = ResolveDonations(inputs, non_donatable);
+    std::vector<bool> donations;
+    if (!ResolveDonations(inputs, non_donatable, donations, result.error_message)) {
+        MPS_LOG_ERROR("%s\n", result.error_message.c_str());
+        return result;
+    }
     const bool anyDonations =
         std::any_of(donations.cbegin(), donations.cend(), [](bool d) { return d; });
 
