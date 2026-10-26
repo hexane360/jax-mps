@@ -1009,6 +1009,9 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
         dispatch_start = Clock::now();
     }
     std::vector<mlx::core::array> outputs;
+    // Set when the compiled path was adopted without the trace-run probe below;
+    // a failure in the final eval then reverts to the eager path for later calls.
+    bool compile_unverified = false;
 
     static bool disable_compile = std::getenv("MPS_NO_COMPILE") != nullptr;
     {
@@ -1045,9 +1048,14 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
 
                 auto test_outputs = compiled_fn_(inputArrays);
                 if (!test_outputs.empty()) {
-                    // without donation, evaluate as well
-                    // with donation, we can't fall back to the eager path after donations occur
-                    if (!anyDonations) {
+                    // With donations, skip the probe: evaluating here while
+                    // inputArrays still holds the donated inputs would keep
+                    // them alive and forfeit the memory reuse on this call.
+                    // The final eval below still surfaces any failure, and
+                    // compile_unverified reverts to the eager path if it does.
+                    if (anyDonations) {
+                        compile_unverified = true;
+                    } else {
                         mlx::core::eval(test_outputs);
                         // An exception thrown by a primitive's eval on a stream
                         // worker thread is caught there (MLX patch 10) and parked;
@@ -1147,6 +1155,10 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
             mlx::core::scheduler::rethrow_pending_exception();
         } catch (const std::exception& e) {
             MPS_LOG_ERROR("MLX evaluation failed: %s\n", e.what());
+            if (compile_unverified) {
+                MPS_LOG_INFO("Unverified compiled path failed, using direct path\n");
+                compile_succeeded_ = false;
+            }
             result.error_message = std::string("eval: ") + e.what();
             capture.AbortCapture();
             return result;

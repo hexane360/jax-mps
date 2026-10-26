@@ -130,13 +130,15 @@ def initialize() -> None:
             stacklevel=2,
         )
 
-    # register support for buffer donation (uses a private API, so we're careful here)
+    # Register support for buffer donation. JAX hardcodes the platforms that
+    # support donation and has no public API to extend the list, so we append to
+    # the private one.
     try:
         from jax._src.interpreters.mlir import _platforms_with_donation
 
         if "mps" not in _platforms_with_donation:
             _platforms_with_donation.append("mps")
-    except ImportError as e:
+    except (ImportError, AttributeError) as e:
         warnings.warn(
             f"jax-mps: failed to register support for buffer donations: {e}. "
             "donate_argnames/donate_argnums will not work correctly.",

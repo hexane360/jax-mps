@@ -98,6 +98,8 @@ def test_non_donatable_input_indices(mps_device):
     out = fn(s, s)
 
     np.testing.assert_allclose(np.asarray(out), np.arange(4) * 2)
+    assert not s.is_deleted(), "buffer used at a non-donated position must survive"
+    np.testing.assert_allclose(np.asarray(s), np.arange(4))
 
 
 def test_donation_saves_memory(mps_device):
