@@ -4,6 +4,7 @@ from .collectives import make_collectives_op_configs
 from .control_flow import make_control_flow_op_configs
 from .conv import make_conv_op_configs
 from .conversion import make_conversion_op_configs
+from .donation import make_donation_op_configs
 from .flax import make_flax_op_configs
 from .fused import make_fused_op_configs
 from .fusion import FusionTestConfig, make_fusion_configs
@@ -29,6 +30,7 @@ __all__ = [
     "make_control_flow_op_configs",
     "make_conv_op_configs",
     "make_conversion_op_configs",
+    "make_donation_op_configs",
     "make_flax_op_configs",
     "make_fused_op_configs",
     "make_fusion_configs",

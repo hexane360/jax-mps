@@ -63,6 +63,9 @@ class OperationTestConfig:
             respect to. Defaults to positional arguments with inexact types.
         static_argnums: Position of arguments that should be treated as static in
             jit-compile.
+        donate_argnums: Position of arguments to donate in jit-compile. Donated
+            arguments must be invalidated after the call and the others kept.
+            Argument factories must return fresh arrays for donated positions.
         name: Display name of the operation test config.
     """
 
@@ -90,6 +93,7 @@ class OperationTestConfig:
         *args: Any,
         differentiable_argnums: Sequence[int] | None = None,
         static_argnums: Sequence[int] | None = None,
+        donate_argnums: Sequence[int] | None = None,
         grad_transform: Callable | None = None,
         grad_xfail: str | None = None,
         grad_xfail_strict: bool = True,
@@ -101,6 +105,7 @@ class OperationTestConfig:
         self.func = func
         self.differentiable_argnums = differentiable_argnums
         self.static_argnums = static_argnums
+        self.donate_argnums = tuple(donate_argnums or ())
         self.grad_transform = grad_transform or jax.grad
         self.grad_xfail = grad_xfail
         # jax.config flags to apply (and restore) around evaluation. Needed for
@@ -196,15 +201,36 @@ class OperationTestConfig:
         lowered = None
         func = self.func
         if jit:
-            func = jax.jit(func, static_argnums=self.static_argnums)
+            func = jax.jit(
+                func,
+                static_argnums=self.static_argnums,
+                donate_argnums=self.donate_argnums,
+            )
             lowered = func.lower(*args, **kwargs)
         result = func(*args, **kwargs)
+        if jit and self.donate_argnums:
+            self._check_donation(args)
 
         # Only mark ops as exercised if the operation succeeded on MPS.
         if lowered and get_device_placement(result) == MPS_DEVICE:
             stablehlo_text = str(lowered.compiler_ir(dialect="stablehlo"))
             self.EXERCISED_STABLEHLO_OPS.update(STABLEHLO_OP_RE.findall(stablehlo_text))
         return result
+
+    def _check_donation(self, args) -> None:
+        for argnum, arg in enumerate(args):
+            if not isinstance(arg, jax.Array):
+                continue
+            if argnum in self.donate_argnums:
+                assert arg.is_deleted(), (
+                    f"Donated argument {argnum} was not invalidated."
+                )
+                with pytest.raises(RuntimeError):
+                    numpy.asarray(arg)
+            else:
+                assert not arg.is_deleted(), (
+                    f"Non-donated argument {argnum} was invalidated."
+                )
 
     def evaluate_grad(self, argnum: int, jit: bool) -> tuple[jnp.ndarray]:
         """Evaluate the gradient of the operation. If the operation returns a tuple of
