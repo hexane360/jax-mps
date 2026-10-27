@@ -16,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -838,10 +839,62 @@ std::unique_ptr<MlxExecutable> MlxExecutable::Create(mps::ParsedModule parsed_mo
         }
     }
 
+    executable->ParseDonationAttributes();
+
     executable->valid_ = true;
     MPS_LOG_DEBUG("Created MlxExecutable with %zu outputs\n", executable->num_outputs_);
 
     return executable;
+}
+
+void MlxExecutable::ParseDonationAttributes() {
+    auto entry = parsed_module_.entry_func;
+    const unsigned num_args = entry.getNumArguments();
+
+    donated_inputs_.assign(num_args, false);
+    input_output_aliases_.assign(num_args, -1);
+    has_donations_ = false;
+
+    for (unsigned i = 0; i < num_args; ++i) {
+        bool donated = false;
+
+        if (auto alias = entry.getArgAttrOfType<mlir::IntegerAttr>(i, "tf.aliasing_output")) {
+            int64_t out_index = alias.getInt();
+            if (out_index < 0 || out_index >= num_outputs_) {
+                // invalid donation
+                MPS_LOG_WARN("Ignoring tf.aliasing_output=%lld on argument %u: only %zu outputs\n",
+                             static_cast<long long>(out_index), i, num_outputs_);
+            } else {
+                input_output_aliases_[i] = static_cast<int>(out_index);
+                donated = true;
+            }
+        }
+
+        if (auto donor = entry.getArgAttrOfType<mlir::BoolAttr>(i, "jax.buffer_donor")) {
+            donated = donated || donor.getValue();
+        }
+
+        donated_inputs_[i] = donated;
+        has_donations_ = has_donations_ || donated;
+    }
+
+    if (has_donations_) {
+        std::string summary;
+        llvm::raw_string_ostream os(summary);
+        for (unsigned i = 0; i < num_args; ++i) {
+            if (!donated_inputs_[i]) {
+                continue;
+            }
+            if (!summary.empty()) {
+                os << ", ";
+            }
+            os << i;
+            if (input_output_aliases_[i] != -1) {
+                os << "->out" << input_output_aliases_[i];
+            }
+        }
+        MPS_LOG_DEBUG("Donated arguments: %s\n", summary.c_str());
+    }
 }
 
 MlxExecutable::~MlxExecutable() = default;
@@ -871,7 +924,47 @@ std::string MlxExecutable::OptimizedModuleText() const {
     return text;
 }
 
-MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
+bool MlxExecutable::ResolveDonations(const std::vector<MlxBuffer*>& inputs,
+                                     const std::vector<int64_t>& non_donatable,
+                                     std::vector<bool>& donate, std::string& error) const {
+    donate.clear();
+    if (!has_donations_ || inputs.size() != donated_inputs_.size()) {
+        return true;
+    }
+
+    donate = donated_inputs_;
+
+    for (int64_t index : non_donatable) {
+        if (index >= 0 && static_cast<size_t>(index) < donate.size()) {
+            donate[index] = false;
+        }
+    }
+
+    // A donated buffer must not appear at any other argument position: its
+    // storage would be reclaimed while still in use. Reject this like XLA's
+    // PJRT clients do, before anything has been invalidated.
+    std::unordered_map<const MlxBuffer*, size_t> first_use;
+    first_use.reserve(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        auto [it, inserted] = first_use.emplace(inputs[i], i);
+        if (inserted) {
+            continue;
+        }
+        size_t first = it->second;
+        if (donate[first] || donate[i]) {
+            error =
+                "Attempt to use a buffer that was previously donated in the same call to "
+                "Execute() (flattened argument " +
+                std::to_string(i) + ", first use: " + std::to_string(first) + ")";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs,
+                                        const std::vector<int64_t>& non_donatable) {
     MlxExecuteResult result;
     const bool profiling = IsProfilingEnabled();
     Clock::time_point exec_start;
@@ -915,6 +1008,14 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
         inputArrays.push_back(inputs[i]->array());
     }
 
+    std::vector<bool> donations;
+    if (!ResolveDonations(inputs, non_donatable, donations, result.error_message)) {
+        MPS_LOG_ERROR("%s\n", result.error_message.c_str());
+        return result;
+    }
+    const bool anyDonations =
+        std::any_of(donations.cbegin(), donations.cend(), [](bool d) { return d; });
+
     ExecContext ctx;
     ctx.module = *parsed_module_.module;
 
@@ -922,6 +1023,9 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
         dispatch_start = Clock::now();
     }
     std::vector<mlx::core::array> outputs;
+    // Set when the compiled path was adopted without the trace-run probe below;
+    // a failure in the final eval then reverts to the eager path for later calls.
+    bool compile_unverified = false;
 
     static bool disable_compile = std::getenv("MPS_NO_COMPILE") != nullptr;
     {
@@ -958,17 +1062,26 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
 
                 auto test_outputs = compiled_fn_(inputArrays);
                 if (!test_outputs.empty()) {
-                    mlx::core::eval(test_outputs);
-                    // An exception thrown by a primitive's eval on a stream
-                    // worker thread is caught there (MLX patch 10) and parked;
-                    // eval() above can complete without traversing an
-                    // array::wait() that would rethrow it. Probe explicitly so
-                    // a failed trace run triggers the catch below (falling back
-                    // to the eager path) instead of returning outputs whose
-                    // producing task died — i.e. never-written buffers. Also
-                    // consumes the parked exception so it cannot poison the
-                    // eager fallback run.
-                    mlx::core::scheduler::rethrow_pending_exception();
+                    // With donations, skip the probe: evaluating here while
+                    // inputArrays still holds the donated inputs would keep
+                    // them alive and forfeit the memory reuse on this call.
+                    // The final eval below still surfaces any failure, and
+                    // compile_unverified reverts to the eager path if it does.
+                    if (anyDonations) {
+                        compile_unverified = true;
+                    } else {
+                        mlx::core::eval(test_outputs);
+                        // An exception thrown by a primitive's eval on a stream
+                        // worker thread is caught there (MLX patch 10) and parked;
+                        // eval() above can complete without traversing an
+                        // array::wait() that would rethrow it. Probe explicitly so
+                        // a failed trace run triggers the catch below (falling back
+                        // to the eager path) instead of returning outputs whose
+                        // producing task died — i.e. never-written buffers. Also
+                        // consumes the parked exception so it cannot poison the
+                        // eager fallback run.
+                        mlx::core::scheduler::rethrow_pending_exception();
+                    }
                     compile_succeeded_ = true;
                     outputs = std::move(test_outputs);
                     MPS_LOG_INFO("MLX compile() succeeded - using compiled execution path\n");
@@ -1002,6 +1115,20 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
         }
         return result;
     }
+
+    // invalidate donated inputs
+    if (anyDonations) {
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            if (donations[i]) {
+                // replace underlying array, dropping the previous reference
+                mlx::core::array& array = inputs[i]->array();
+                array = mlx::core::array({}, array.dtype());
+                // and mark as deleted
+                inputs[i]->Delete();
+            }
+        }
+    }
+    inputArrays.clear();
 
     if (profiling) {
         eval_start = Clock::now();
@@ -1042,6 +1169,10 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
             mlx::core::scheduler::rethrow_pending_exception();
         } catch (const std::exception& e) {
             MPS_LOG_ERROR("MLX evaluation failed: %s\n", e.what());
+            if (compile_unverified) {
+                MPS_LOG_INFO("Unverified compiled path failed, using direct path\n");
+                compile_succeeded_ = false;
+            }
             result.error_message = std::string("eval: ") + e.what();
             capture.AbortCapture();
             return result;
